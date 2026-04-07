@@ -179,4 +179,39 @@ async def scan(message: types.Message):
             f"📦 {track} прибыл\n💰 {result[2].price}$"
         )
 
-    await message.answer("OK")
+await message.answer("OK")
+# app/main.py
+from fastapi import FastAPI, Request
+from aiogram.types import Update
+from app.bot import bot, dp
+from app.auth.routes import router as auth_router
+from app.api import users, parcels
+
+app = FastAPI()
+
+app.include_router(auth_router)
+app.include_router(users.router)
+app.include_router(parcels.router)
+
+@app.post("/webhook")
+async def webhook(req: Request):
+    data = await req.json()
+    update = Update(**data)
+    await dp.feed_update(bot, update)
+    return {"ok": True}
+# app/api/parcels.py
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from app.db.session import SessionLocal
+from app.db.models import Parcel
+
+router = APIRouter(prefix="/parcels")
+
+def get_db():
+    db = SessionLocal()
+    try: yield db
+    finally: db.close()
+
+@router.get("/")
+def list_parcels(db: Session = Depends(get_db)):
+    return db.query(Parcel).all()
