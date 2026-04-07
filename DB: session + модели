@@ -1,3 +1,24 @@
+# app/auth/routes.py
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from app.db.session import SessionLocal
+from app.db.models import User
+from app.auth.security import create_token
+
+router = APIRouter(prefix="/auth")
+
+def get_db():
+    db = SessionLocal()
+    try: yield db
+    finally: db.close()
+
+@router.post("/login")
+def login(username: str, password: str, db: Session = Depends(get_db)):
+    user = db.query(User).filter_by(username=username, password=password).first()
+    if not user:
+        return {"error": "invalid credentials"}
+    token = create_token({"user_id": user.id, "role": user.role})
+    return {"access_token": token}
 # app/db/session.py
 import os
 from sqlalchemy import create_engine
@@ -8,3 +29,154 @@ DATABASE_URL = f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASS')}@{os.
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
+# app/db/models.py
+from sqlalchemy import Column, Integer, String, Numeric, ForeignKey, Enum
+from sqlalchemy.orm import relationship
+import enum
+from .session import Base
+
+class RoleEnum(str, enum.Enum):
+    ADMIN = "ADMIN"
+    OPERATOR_CN = "OPERATOR_CN"
+    OPERATOR_TJ = "OPERATOR_TJ"
+    CLIENT = "CLIENT"
+
+class StatusEnum(str, enum.Enum):
+    CREATED = "CREATED"
+    IN_TRANSIT = "IN_TRANSIT"
+    ARRIVED_TJ = "ARRIVED_TJ"
+    READY = "READY"
+    ISSUED = "ISSUED"
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(String, unique=True, nullable=True)
+    username = Column(String, unique=True, nullable=True)
+    password = Column(String, nullable=True)
+    role = Column(Enum(RoleEnum), default=RoleEnum.CLIENT)
+
+class Parcel(Base):
+    __tablename__ = "parcels"
+    id = Column(Integer, primary_key=True)
+    track_code = Column(String, unique=True, index=True)
+    status = Column(Enum(StatusEnum), default=StatusEnum.CREATED)
+    weight = Column(Numeric, nullable=True)
+    price = Column(Numeric, nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
+    user = relationship("User")
+# app/auth/security.py
+import os, jwt
+from datetime import datetime, timedelta
+from fastapi import HTTPException
+
+SECRET = os.getenv("JWT_SECRET")
+
+def create_token(data: dict):
+    payload = data.copy()
+    payload["exp"] = datetime.utcnow() + timedelta(minutes=60)
+    return jwt.encode(payload, SECRET, algorithm="HS256")
+
+def decode_token(token: str):
+    try:
+        return jwt.decode(token, SECRET, algorithms=["HS256"])
+    except:
+        raise HTTPException(401, "Invalid token")
+
+# app/services/pricing.py
+def calculate_price(weight: float):
+    rate = 5
+    return weight * rate
+# app/services/parcel_service.py
+from app.db.session import SessionLocal
+from app.db.models import Parcel, User, StatusEnum
+from app.services.pricing import calculate_price
+
+def process_scan(track_code: str, operator_role: str):
+    db = SessionLocal()
+
+    parcel = db.query(Parcel).filter_by(track_code=track_code).first()
+
+    if not parcel:
+        parcel = Parcel(track_code=track_code, status=StatusEnum.IN_TRANSIT)
+        db.add(parcel)
+        db.commit()
+        return "created", None, parcel
+
+    # логика по ролям
+    if operator_role == "OPERATOR_TJ":
+        parcel.status = StatusEnum.ARRIVED_TJ
+        parcel.weight = parcel.weight or 1
+        parcel.price = calculate_price(parcel.weight)
+
+    db.commit()
+
+    user = None
+    if parcel.user_id:
+        user = db.query(User).get(parcel.user_id)
+
+    return "updated", user, parcel
+
+
+def bulk_scan(track_codes: list, role: str):
+    results = []
+    for code in track_codes:
+        results.append(process_scan(code, role))
+    return results
+
+
+def bind_track_to_user(track_code: str, telegram_id: str):
+    db = SessionLocal()
+
+    user = db.query(User).filter_by(telegram_id=telegram_id).first()
+    if not user:
+        user = User(telegram_id=telegram_id)
+        db.add(user)
+        db.commit()
+
+    parcel = db.query(Parcel).filter_by(track_code=track_code).first()
+    if not parcel:
+        parcel = Parcel(track_code=track_code, user_id=user.id)
+        db.add(parcel)
+    else:
+        parcel.user_id = user.id
+
+    db.commit()
+    return parcel
+# app/bot.py
+from aiogram import Bot, Dispatcher, types
+import os
+from app.services.parcel_service import process_scan, bulk_scan, bind_track_to_user
+
+bot = Bot(token=os.getenv("BOT_TOKEN"))
+dp = Dispatcher()
+
+@dp.message(commands=["start"])
+async def start(message: types.Message):
+    await message.answer("Вы зарегистрированы")
+
+@dp.message(commands=["add"])
+async def add_track(message: types.Message):
+    track = message.text.split(" ")[1]
+    bind_track_to_user(track, str(message.from_user.id))
+    await message.answer(f"Трек привязан: {track}")
+
+@dp.message(commands=["scan_bulk"])
+async def scan_bulk(message: types.Message):
+    tracks = message.text.replace("/scan_bulk", "").strip().split()
+    res = bulk_scan(tracks, "OPERATOR_TJ")
+    await message.answer(f"Обработано: {len(res)}")
+
+@dp.message()
+async def scan(message: types.Message):
+    track = message.text.strip()
+    result = process_scan(track, "OPERATOR_TJ")
+
+    if result[0] == "updated" and result[1]:
+        await bot.send_message(
+            result[1].telegram_id,
+            f"📦 {track} прибыл\n💰 {result[2].price}$"
+        )
+
+    await message.answer("OK")
